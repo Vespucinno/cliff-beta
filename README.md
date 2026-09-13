@@ -1,0 +1,2 @@
+Ini Cliff
+buat lomba
