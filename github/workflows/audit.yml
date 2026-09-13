@@ -1,0 +1,85 @@
+name: CLIFF Serverless Security Audit
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  security-audit:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Extract PR Diff
+        id: get_diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DIFF=$(gh pr diff ${{ github.event.pull_request.number }})
+          echo "PR_DIFF<<EOF" >> $GITHUB_ENV
+          echo "$DIFF" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run OWASP Audit
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: node audit.js
+
+      - name: Post Comment to PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const result = fs.readFileSync('audit-result.md', 'utf8');
+            const body = `## 🛡️ CLIFF Serverless Security Audit (OWASP 10)\n\n${result}`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Post Inline Review Comments
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+
+            // 1. Baca hasil JSON dari file audit
+            const rawData = fs.readFileSync('audit-result.json', 'utf8');
+            const findings = JSON.parse(rawData);
+
+            if (!Array.isArray(findings) || findings.length === 0) {
+              console.log('✅ Tidak ada kerentanan ditemukan.');
+              return;
+            }
+
+            // 2. Format menjadi array comments sesuai spec API GitHub
+            const comments = findings.map(item => ({
+              path: item.path,
+              line: Number(item.line),
+              body: `🚨 **[CLIFF SAST - ${item.severity}]**\n\n${item.message}`
+            }));
+
+            // 3. Kirim Review dengan Inline Comments ke PR
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              commit_id: context.payload.pull_request.head.sha,
+              event: 'REQUEST_CHANGES', // Status PR otomatis meminta perubahan
+              comments: comments
+            });
