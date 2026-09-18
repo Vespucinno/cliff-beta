@@ -8,11 +8,11 @@
     "forceConsistentCasingInFileNames": true,
     "strict": true,
     "skipLibCheck": true,
-    "ignoreDeprecations": "6.0",
     "allowSyntheticDefaultImports": true
   },
   "ts-node": {
     "files": true
   },
-  "include": ["src/**/*", "github/scripts/audit.ts"]
+  "include": ["src/**/*"]
 }
+

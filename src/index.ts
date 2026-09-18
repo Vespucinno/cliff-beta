@@ -1,6 +1,6 @@
 import express, { Request, Response } from "express";
 import dotenv from "dotenv";
-import { getPrDiff, postGithubComment } from "./services/github";
+import { getPrDiff, publishGithubReview } from "./services/github";
 import { runHermesAnalysis } from "./services/hermes";
 
 dotenv.config();
@@ -24,15 +24,16 @@ async function processPrWorkflow(payload: any) {
     const reviewData = await runHermesAnalysis(diffText, prTitle);
 
     if (GITHUB_TOKEN) {
-      await postGithubComment(repoName, prNumber, reviewData, GITHUB_TOKEN);
-      console.log(`[CLIFF] Successfully posted comment to PR #${prNumber}`);
+      await publishGithubReview(repoName, prNumber, reviewData, GITHUB_TOKEN);
+      console.log(`[CLIFF] Successfully published review for PR #${prNumber}`);
     } else {
-      console.warn("[CLIFF] GITHUB_TOKEN missing. Skipping comment post.");
+      console.warn("[CLIFF] GITHUB_TOKEN missing. Skipping review publish.");
     }
   } catch (error) {
     console.error("[CLIFF] Workflow error:", error);
   }
 }
+
 
 app.post("/webhook/github", (req: Request, res: Response) => {
   const payload = req.body;
