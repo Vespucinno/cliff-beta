@@ -13,6 +13,87 @@ export async function getPrDiff(
   return response.data;
 }
 
+/**
+ * Parses a unified diff string and returns a map of:
+ *   { "path/to/file.py": <reconstructed file content with correct line numbers> }
+ *
+ * Uses a line-by-line state machine — more reliable than regex for
+ * single-hunk files, multi-hunk files, and GitHub's diff format.
+ */
+export function extractFileContentsFromDiff(diffText: string): Record<string, string> {
+  const fileMap: Record<string, string> = {};
+  const lines = diffText.split("\n");
+
+  let currentFile: string | null = null;
+  let lineMap: Map<number, string> = new Map();
+  let newLineNum = 0;
+  let inHunk = false;
+
+  const flushFile = () => {
+    if (currentFile && lineMap.size > 0) {
+      const maxLine = Math.max(...lineMap.keys());
+      const arr: string[] = new Array(maxLine + 1).fill("");
+      for (const [ln, content] of lineMap) arr[ln] = content;
+      fileMap[currentFile] = arr.slice(1).join("\n");
+      console.log(`[CLIFF Diff] Parsed ${lineMap.size} lines for ${currentFile}`);
+    }
+    lineMap = new Map();
+    inHunk = false;
+    newLineNum = 0;
+  };
+
+  for (const line of lines) {
+    // New file section
+    if (line.startsWith("diff --git ")) {
+      flushFile();
+      currentFile = null;
+      continue;
+    }
+
+    // Extract b/ filename
+    if (line.startsWith("+++ b/")) {
+      currentFile = line.slice(6).trim();
+      continue;
+    }
+
+    // Skip deleted file marker and metadata
+    if (line.startsWith("--- ") || line.startsWith("index ") || line.startsWith("new file") || line.startsWith("deleted file")) {
+      continue;
+    }
+
+    // Hunk header: @@ -old,n +newStart,n @@
+    const hunkMatch = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunkMatch) {
+      newLineNum = parseInt(hunkMatch[1], 10);
+      inHunk = true;
+      continue;
+    }
+
+    if (!inHunk || !currentFile) continue;
+
+    if (line.startsWith("+")) {
+      // Added line
+      lineMap.set(newLineNum, line.slice(1));
+      newLineNum++;
+    } else if (line.startsWith("-")) {
+      // Removed line — skip (doesn't exist in new file)
+    } else if (line.startsWith("\\")) {
+      // "No newline at end of file" — skip
+    } else {
+      // Context line (space-prefixed or empty)
+      lineMap.set(newLineNum, line.length > 0 ? line.slice(1) : "");
+      newLineNum++;
+    }
+  }
+
+  // Flush last file
+  flushFile();
+
+  console.log(`[CLIFF Diff] Total files extracted: ${Object.keys(fileMap).join(", ") || "(none)"}`);
+  return fileMap;
+}
+
+
 
 function getSeverityBadge(severity: SeverityLevel): string {
   switch (severity) {
@@ -30,9 +111,10 @@ function getSeverityBadge(severity: SeverityLevel): string {
 
 export function formatFindingMarkdown(finding: Finding, includeFileHeader: boolean = true): string {
   const badge = getSeverityBadge(finding.severity);
+  const locStr = finding.location || (finding.file ? `${finding.file}${finding.line ? `:${finding.line}` : ""}` : null);
   const locationHeader = includeFileHeader
-    ? finding.file
-      ? `\`${finding.file}${finding.line ? `:${finding.line}` : ""}\`\n\n`
+    ? locStr
+      ? `📍 \`${locStr}\`\n\n`
       : "`[File location unconfirmed]`\n\n"
     : "";
 

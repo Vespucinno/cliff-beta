@@ -1,5 +1,6 @@
-import { parseAndValidateReviewResponse } from "../services/hermes";
+import { parseAndValidateReviewResponse, enrichFindingsWithTreeSitter } from "../services/hermes";
 import { formatFindingMarkdown, formatMainReviewMarkdown } from "../services/github";
+import { formatHelpGuideMarkdown, handleGithubCommand } from "../services/commands";
 import { ReviewResult } from "../types";
 
 let passedCount = 0;
@@ -53,6 +54,7 @@ async function runTests() {
     assert(result.findings[0].severity === "high", "Finding severity is high");
     assert(result.findings[0].file === "src/routes/users.py", "Finding file is correct");
     assert(result.findings[0].line === 42, "Finding line is 42");
+    assert(result.findings[0].location === "src/routes/users.py:42", "Finding location is src/routes/users.py:42");
     assert(result.findings[0].evidence.length > 0, "Evidence array is populated");
     assert(result.findings[0].confidence === "high", "Confidence is high");
 
@@ -176,6 +178,112 @@ async function runTests() {
     assert(result.breaking_changes.length === 1, "Breaking change preserved");
   }
 
+  // TEST 7 — Tree-sitter Line Resolution (app.py:8)
+  console.log("\nTest 7: Tree-sitter AST Line Resolution (app.py:8)");
+  {
+    const samplePythonCode = `from flask import Flask, request
+app = Flask(__name__)
+
+@app.route('/user/<username>')
+def get_user(username):
+    # line 7: SQL query interpolation
+    query = f"SELECT * FROM users WHERE username = '{username}'"
+    cursor.execute(query)
+    return cursor.fetchone()
+`;
+
+    const mockUnresolvedResult: ReviewResult = {
+      summary: "Potential SQL injection in Flask route.",
+      risk_level: "high",
+      breaking_changes: [],
+      findings: [
+        {
+          severity: "high",
+          category: "security",
+          title: "SQL Injection Flaw",
+          file: "app.py",
+          line: null, // Unconfirmed line from LLM
+          location: null,
+          description: "Raw f-string query passed to database cursor.",
+          evidence: ["cursor.execute(query)"],
+          why_it_matters: "SQL Injection vulnerability.",
+          suggested_fix: "Use parameterized query placeholders.",
+          confidence: "high"
+        }
+      ]
+    };
+
+    const enriched = await enrichFindingsWithTreeSitter(mockUnresolvedResult, {
+      "app.py": samplePythonCode
+    });
+
+    assert(enriched.findings[0].line === 8, "Tree-sitter resolved app.py missing line to exact line 8");
+    assert(enriched.findings[0].location === "app.py:8", "Tree-sitter updated location property to app.py:8");
+
+    const formatted = formatFindingMarkdown(enriched.findings[0]);
+    assert(formatted.includes("`app.py:8`"), "Formatted finding header shows app.py:8");
+  }
+
+  // TEST 8 — Zod Schema Contract Validation (Invalid "Super High" Severity)
+  console.log("\nTest 8: Zod Schema Contract Validation (Invalid 'Super High' Severity)");
+  {
+    const mockInvalidSeverityOutput = JSON.stringify({
+      summary: "Testing Zod schema validation contract.",
+      risk_level: "invalid_risk",
+      breaking_changes: [],
+      findings: [
+        {
+          severity: "Super High", // Invalid severity enum value
+          category: "invalid_category", // Invalid category enum value
+          title: "Memory Leak",
+          file: "src/server.ts",
+          line: 10,
+          description: "Unclosed socket connection.",
+          evidence: ["socket.connect()"],
+          why_it_matters: "Resource exhaustion.",
+          suggested_fix: "Call socket.close()",
+          confidence: "Super High" // Invalid confidence enum value
+        }
+      ]
+    });
+
+    const result: ReviewResult = parseAndValidateReviewResponse(mockInvalidSeverityOutput);
+
+    assert(result.findings[0].severity === "low", "Zod schema contract invalidated 'Super High' severity and normalized to 'low'");
+    assert(result.findings[0].category === "correctness", "Zod schema contract invalidated 'invalid_category' and normalized to 'correctness'");
+    assert(result.findings[0].confidence === "medium", "Zod schema contract invalidated 'Super High' confidence and normalized to 'medium'");
+    assert(result.risk_level === "low", "Risk level computed as 'low' based on contract compliance");
+  }
+
+  // TEST 9 — GitHub Bot Command Handling (cl help, cl review, cl full-review)
+  console.log("\nTest 9: GitHub Bot Command Handling (cl help, cl review, cl full-review)");
+  {
+    const helpGuide = formatHelpGuideMarkdown();
+    assert(helpGuide.includes("`cl help`"), "Help guide includes cl help command entry");
+    assert(helpGuide.includes("`cl review`"), "Help guide includes cl review command entry");
+    assert(helpGuide.includes("`cl full-review`"), "Help guide includes cl full-review command entry");
+
+    const mockHelpPayload = {
+      action: "created",
+      comment: { body: "cl help" },
+      repository: { full_name: "owner/repo" },
+      issue: { number: 42, title: "Feature PR" }
+    };
+
+    const isHandledHelp = await handleGithubCommand(mockHelpPayload);
+    assert(isHandledHelp === true, "handleGithubCommand successfully processed 'cl help' payload");
+
+    const mockNonCommandPayload = {
+      action: "created",
+      comment: { body: "Looks good to me!" },
+      repository: { full_name: "owner/repo" },
+      issue: { number: 42 }
+    };
+
+    const isHandledNonCmd = await handleGithubCommand(mockNonCommandPayload);
+    assert(isHandledNonCmd === false, "handleGithubCommand correctly ignores non-'cl' comments");
+  }
+
   console.log("\n==================================================");
   console.log(`  SUMMARY: ${passedCount} / ${totalCount} assertions passed.`);
   console.log("==================================================\n");
@@ -192,3 +300,6 @@ runTests().catch((err) => {
   console.error("Fatal test runner error:", err);
   process.exit(1);
 });
+
+
+

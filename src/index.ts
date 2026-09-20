@@ -1,7 +1,8 @@
 import express, { Request, Response } from "express";
 import dotenv from "dotenv";
-import { getPrDiff, publishGithubReview } from "./services/github";
+import { getPrDiff, publishGithubReview, extractFileContentsFromDiff } from "./services/github";
 import { runHermesAnalysis } from "./services/hermes";
+import { handleGithubCommand } from "./services/commands";
 
 dotenv.config();
 
@@ -21,7 +22,13 @@ async function processPrWorkflow(payload: any) {
     console.log(`[CLIFF] Processing PR #${prNumber} for ${repoName}...`);
 
     const diffText = await getPrDiff(diffUrl, GITHUB_TOKEN);
-    const reviewData = await runHermesAnalysis(diffText, prTitle);
+
+    // Parse the diff to give tree-sitter real file content for line resolution
+    const fileContentMap = extractFileContentsFromDiff(diffText);
+    const fileCount = Object.keys(fileContentMap).length;
+    console.log(`[CLIFF] Extracted content for ${fileCount} changed file(s): ${Object.keys(fileContentMap).join(", ")}`);
+
+    const reviewData = await runHermesAnalysis(diffText, prTitle, [], fileContentMap);
 
     if (GITHUB_TOKEN) {
       await publishGithubReview(repoName, prNumber, reviewData, GITHUB_TOKEN);
@@ -34,13 +41,20 @@ async function processPrWorkflow(payload: any) {
   }
 }
 
-
 app.post("/webhook/github", (req: Request, res: Response) => {
   const payload = req.body;
+  const githubEvent = req.headers["x-github-event"] as string;
   const action = payload?.action;
 
-  if (["opened", "synchronize"].includes(action)) {
-    // Fire-and-forget asynchronous execution
+  console.log(`[CLIFF] Received event: ${githubEvent} / action: ${action}`);
+
+  // issue_comment = PR conversation tab comment; pull_request_review_comment = inline diff comment
+  const commentText = payload?.comment?.body?.trim() || "";
+
+  if (commentText && /^cl\b/i.test(commentText)) {
+    console.log(`[CLIFF] Command detected: "${commentText}"`);
+    handleGithubCommand(payload, GITHUB_TOKEN);
+  } else if (["opened", "synchronize"].includes(action) && githubEvent === "pull_request") {
     processPrWorkflow(payload);
   }
 

@@ -1,6 +1,12 @@
 import axios from "axios";
-import { ReviewResult, Finding, SeverityLevel, FindingCategory, ConfidenceLevel } from "../types";
+import path from "path";
+import { ReviewResult, ReviewResultSchema, SeverityLevel } from "../types";
 import { CallSite } from "./ast";
+import { 
+  parseFileAstNodes, 
+  resolveFindingLineWithTreeSitter,
+  extractChangedLinesFromDiff
+} from "./treeSitter";
 
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434/api/generate";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "hermes3";
@@ -47,60 +53,81 @@ export function parseAndValidateReviewResponse(rawInput: unknown): ReviewResult 
     };
   }
 
-  const validSeverities: SeverityLevel[] = ["low", "medium", "high", "critical"];
-  const validCategories: FindingCategory[] = ["security", "correctness", "performance", "maintainability", "testing"];
-  const validConfidences: ConfidenceLevel[] = ["low", "medium", "high"];
+  // Normalize object keys and string enum cases before Zod validation
+  const normalizedFindings = Array.isArray(parsed.findings)
+    ? parsed.findings.map((f: any) => {
+        const file = typeof f?.file === "string" && f.file.trim().length > 0 ? f.file.trim() : null;
+        const line = typeof f?.line === "number" && f.line > 0 ? f.line : typeof f?.line === "string" && !isNaN(parseInt(f.line, 10)) && parseInt(f.line, 10) > 0 ? parseInt(f.line, 10) : null;
+        const location = typeof f?.location === "string" && f.location.trim().length > 0
+          ? f.location.trim()
+          : file && line
+          ? `${file}:${line}`
+          : file
+          ? file
+          : null;
 
-  // Sanitize findings array
-  const rawFindings = Array.isArray(parsed.findings) ? parsed.findings : [];
-  const findings: Finding[] = rawFindings.map((f: any) => {
-    const rawSev = String(f?.severity || "").toLowerCase() as SeverityLevel;
-    const severity: SeverityLevel = validSeverities.includes(rawSev) ? rawSev : "low";
+        return {
+          severity: typeof f?.severity === "string" ? f.severity.toLowerCase().trim() : f?.severity,
+          category: typeof f?.category === "string" ? f.category.toLowerCase().trim() : f?.category,
+          title: typeof f?.title === "string" ? f.title : "Issue identified",
+          file,
+          line,
+          location,
+          description: typeof f?.description === "string" ? f.description : "Potential issue in PR diff",
+          evidence: Array.isArray(f?.evidence) ? f.evidence.map(String) : typeof f?.evidence === "string" ? [f.evidence] : [],
+          why_it_matters: typeof f?.why_it_matters === "string" ? f.why_it_matters : "May cause runtime errors or security vulnerabilities.",
+          suggested_fix: typeof f?.suggested_fix === "string" ? f.suggested_fix : "Review and update implementation.",
+          confidence: typeof f?.confidence === "string" ? f.confidence.toLowerCase().trim() : f?.confidence,
+        };
+      })
+    : [];
 
-    const rawCat = String(f?.category || "").toLowerCase() as FindingCategory;
-    const category: FindingCategory = validCategories.includes(rawCat) ? rawCat : "correctness";
+  const rawNormalized = {
+    summary: typeof parsed.summary === "string" ? parsed.summary.trim() : "",
+    risk_level: typeof parsed.risk_level === "string" ? parsed.risk_level.toLowerCase().trim() : "low",
+    breaking_changes: Array.isArray(parsed.breaking_changes) ? parsed.breaking_changes.map(String) : [],
+    suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions.map(String) : undefined,
+    findings: normalizedFindings,
+  };
 
-    const rawConf = String(f?.confidence || "").toLowerCase() as ConfidenceLevel;
-    const confidence: ConfidenceLevel = validConfidences.includes(rawConf) ? rawConf : "medium";
+  // Run Zod schema validation
+  const zodParsed = ReviewResultSchema.safeParse(rawNormalized);
 
-    let line: number | null = null;
-    if (typeof f?.line === "number" && !isNaN(f.line) && f.line > 0) {
-      line = f.line;
-    } else if (typeof f?.line === "string" && !isNaN(parseInt(f.line, 10))) {
-      const parsedLine = parseInt(f.line, 10);
-      if (parsedLine > 0) line = parsedLine;
-    }
-
-    const file = typeof f?.file === "string" && f.file.trim().length > 0 ? f.file.trim() : null;
-
-    const evidence = Array.isArray(f?.evidence)
-      ? f.evidence.map((e: any) => String(e))
-      : typeof f?.evidence === "string"
-      ? [f.evidence]
-      : [];
-
-    return {
-      severity,
-      category,
-      title: String(f?.title || "Issue identified"),
-      file,
-      line,
-      description: String(f?.description || "Potential issue in PR diff"),
-      evidence,
-      why_it_matters: String(f?.why_it_matters || "May cause runtime errors or security vulnerabilities."),
-      suggested_fix: String(f?.suggested_fix || "Review and update implementation."),
-      confidence,
+  let resultData: ReviewResult;
+  if (zodParsed.success) {
+    resultData = zodParsed.data;
+  } else {
+    // If Zod validation hit contract errors, log warning and use safe schema defaults
+    console.warn("[CLIFF Zod] Schema contract warning:", zodParsed.error.format());
+    resultData = {
+      summary: rawNormalized.summary || "Review output parsed with fallback.",
+      risk_level: "low",
+      breaking_changes: rawNormalized.breaking_changes,
+      suggestions: rawNormalized.suggestions,
+      findings: rawNormalized.findings.map((f: any) => ({
+        severity: ["low", "medium", "high", "critical"].includes(f.severity) ? f.severity : "low",
+        category: ["security", "correctness", "performance", "maintainability", "testing"].includes(f.category) ? f.category : "correctness",
+        title: f.title || "Issue identified",
+        file: f.file || null,
+        line: f.line || null,
+        location: f.file && f.line ? `${f.file}:${f.line}` : f.file || null,
+        description: f.description || "Potential issue in PR diff",
+        evidence: f.evidence || [],
+        why_it_matters: f.why_it_matters || "May cause runtime errors or security vulnerabilities.",
+        suggested_fix: f.suggested_fix || "Review and update implementation.",
+        confidence: ["low", "medium", "high"].includes(f.confidence) ? f.confidence : "medium",
+      })),
     };
-  });
+  }
 
   // Calculate dynamic risk_level based on findings
   let computedRisk: SeverityLevel = "low";
-  if (findings.length > 0) {
-    if (findings.some((f) => f.severity === "critical")) {
+  if (resultData.findings.length > 0) {
+    if (resultData.findings.some((f) => f.severity === "critical")) {
       computedRisk = "critical";
-    } else if (findings.some((f) => f.severity === "high")) {
+    } else if (resultData.findings.some((f) => f.severity === "high")) {
       computedRisk = "high";
-    } else if (findings.some((f) => f.severity === "medium")) {
+    } else if (resultData.findings.some((f) => f.severity === "medium")) {
       computedRisk = "medium";
     } else {
       computedRisk = "low";
@@ -109,37 +136,156 @@ export function parseAndValidateReviewResponse(rawInput: unknown): ReviewResult 
     computedRisk = "low";
   }
 
-  // Summary
-  let summary = typeof parsed.summary === "string" && parsed.summary.trim() ? parsed.summary.trim() : "";
+  let summary = resultData.summary;
   if (!summary) {
-    summary = findings.length > 0
-      ? `Identified ${findings.length} actionable finding(s) in this PR.`
+    summary = resultData.findings.length > 0
+      ? `Identified ${resultData.findings.length} actionable finding(s) in this PR.`
       : "No high-confidence issues were identified.";
   }
 
-  // Breaking changes
-  const breaking_changes = Array.isArray(parsed.breaking_changes)
-    ? parsed.breaking_changes.map((b: any) => String(b))
-    : [];
-
-  const result: ReviewResult = {
+  return {
+    ...resultData,
     summary,
     risk_level: computedRisk,
-    breaking_changes,
-    findings,
+    findings: resultData.findings.map((f) => ({
+      ...f,
+      location: f.file && f.line ? `${f.file}:${f.line}` : f.file || null,
+    })),
   };
+}
 
-  if (Array.isArray(parsed.suggestions)) {
-    result.suggestions = parsed.suggestions.map((s: any) => String(s));
+export async function enrichFindingsWithTreeSitter(
+  result: ReviewResult,
+  fileContentMap?: Record<string, string>,
+  diffText?: string,
+): Promise<ReviewResult> {
+  if (!result.findings || result.findings.length === 0) {
+    return result;
   }
 
-  return result;
+  // Pre-compute changed lines per file from diff for cross-referencing
+  const changedLinesMap: Record<string, Set<number>> = {};
+  if (diffText) {
+    for (const file of Object.keys(fileContentMap || {})) {
+      changedLinesMap[file] = extractChangedLinesFromDiff(diffText, file);
+    }
+  }
+
+  const updatedFindings = await Promise.all(
+    result.findings.map(async (finding) => {
+      let activeLine = finding.line;
+      // finding.file can be null, so check before using as index
+      const fileName = finding.file || null;
+      const fileContent = fileName ? (fileContentMap?.[fileName] || fileContentMap?.[path.basename(fileName)]) : undefined;
+      const changedLines = fileName ? (changedLinesMap[fileName] || changedLinesMap[path.basename(fileName)]) : undefined;
+
+      // Always validate the line (even if LLM provided one) against evidence
+      if (fileName && fileContent) {
+        // First, check if the current line actually contains relevant evidence
+        const lineIsValid = activeLine && activeLine > 0 && activeLine <= fileContent.split("\n").length
+          ? fileContent.split("\n")[activeLine - 1].length > 0
+          : false;
+
+        // If line is invalid or we want to verify it, try to resolve
+        if (!lineIsValid || activeLine === null || activeLine === undefined) {
+          const resolvedLine = await resolveFindingLineWithTreeSitter(
+            fileName,
+            fileContent,
+            finding.evidence,
+            finding.title,
+            changedLines,
+          );
+          if (resolvedLine) {
+            activeLine = resolvedLine;
+          }
+        } else {
+          // Even if line exists, verify it matches evidence - if not, try to find better line
+          const lineContent = fileContent.split("\n")[activeLine - 1];
+          const tokens = extractSearchTokensFromEvidence(finding.evidence);
+          const hasMatchingToken = tokens.some(t => lineContent.includes(t));
+          
+          if (!hasMatchingToken && tokens.length > 0) {
+            console.log(`[CLIFF Tree-sitter] LLM line ${activeLine} doesn't match evidence, attempting re-resolution`);
+            const resolvedLine = await resolveFindingLineWithTreeSitter(
+              fileName,
+              fileContent,
+              finding.evidence,
+              finding.title,
+              changedLines,
+            );
+            if (resolvedLine && resolvedLine !== activeLine) {
+              console.log(`[CLIFF Tree-sitter] Corrected line from ${activeLine} to ${resolvedLine}`);
+              activeLine = resolvedLine;
+            }
+          }
+        }
+      }
+
+      const location = fileName && activeLine ? `${fileName}:${activeLine}` : fileName || null;
+      return {
+        ...finding,
+        line: activeLine,
+        location,
+      };
+    }),
+  );
+
+  return {
+    ...result,
+    findings: updatedFindings,
+  };
+}
+
+// Helper to extract tokens from evidence (mirror of treeSitter's extractSearchTokens)
+function extractSearchTokensFromEvidence(evidenceSnippets: string[]): string[] {
+  const seen = new Set<string>();
+  const tokens: string[] = [];
+
+  function add(t: string) {
+    const s = t.trim();
+    if (s.length >= 5 && !seen.has(s)) {
+      seen.add(s);
+      tokens.push(s);
+    }
+  }
+
+  for (const raw of evidenceSnippets) {
+    const clean = raw.replace(/^[`"']|[`"']$/g, "").trim();
+    if (!clean) continue;
+
+    const blocks = clean.split(/\s*\.\.\.+\s*/);
+
+    for (const block of blocks) {
+      const b = block.trim();
+      if (!b) continue;
+
+      const callMatches = b.matchAll(/[\w.]+\s*\([^)]*\)/g);
+      for (const m of callMatches) add(m[0]);
+
+      const assignMatches = b.matchAll(/\b\w+\s*=\s*[^\s=][^\n]*/g);
+      for (const m of assignMatches) add(m[0].trim());
+
+      const decoratorMatches = b.matchAll(/@[\w.]+(?:\([^)]*\))?/g);
+      for (const m of decoratorMatches) add(m[0]);
+
+      const withMatches = b.matchAll(/\bwith\s+\w[^\n]*/g);
+      for (const m of withMatches) add(m[0].trim());
+
+      const importMatches = b.matchAll(/(?:import|from)\s+[\w.]+[^\n]*/g);
+      for (const m of importMatches) add(m[0].trim());
+
+      add(b);
+    }
+  }
+
+  return tokens.sort((a, b) => b.length - a.length);
 }
 
 export async function runHermesAnalysis(
   diffText: string,
   prTitle: string,
   dominoSites: CallSite[] = [],
+  fileContentMap?: Record<string, string>,
 ): Promise<ReviewResult> {
   const safeDiffText = diffText.length > MAX_DIFF_LENGTH
     ? `${diffText.slice(0, MAX_DIFF_LENGTH)}\n... [PR Diff truncated for LLM context length]`
@@ -154,6 +300,24 @@ export async function runHermesAnalysis(
         .join("\n")
     : "No downstream call sites detected.";
 
+  let treeSitterContext = "";
+  if (fileContentMap) {
+    const nodeSummaries: string[] = [];
+    for (const [file, content] of Object.entries(fileContentMap)) {
+      const nodes = await parseFileAstNodes(file, content);
+      if (nodes.length > 0) {
+        const nodeStr = nodes
+          .slice(0, 10)
+          .map((n) => `  * [${n.type}] (Lines ${n.startLine}-${n.endLine}): \`${n.snippet}\``)
+          .join("\n");
+        nodeSummaries.push(`File: ${file}\n${nodeStr}`);
+      }
+    }
+    if (nodeSummaries.length > 0) {
+      treeSitterContext = `\n=== TREE-SITTER REPOSITORY CODE NODES ===\n${nodeSummaries.join("\n\n")}\n`;
+    }
+  }
+
   const prompt = `You are an expert, evidence-based AI Code Reviewer. Analyze the PR diff below for concrete issues (prioritizing security and correctness).
 
 PR Title: ${prTitle}
@@ -163,7 +327,7 @@ ${safeDiffText}
 
 === POTENTIAL DOWNSTREAM CALL SITES AT RISK ===
 ${dominoContext}
-
+${treeSitterContext}
 RULES FOR YOUR REVIEW:
 1. HIGH SIGNAL ONLY: Every finding MUST contain concrete evidence directly observed from the PR diff or context.
 2. DO NOT FORCE FINDINGS: If the PR is clean or has no high-confidence vulnerabilities/bugs, return an empty "findings" array ("findings": []), "risk_level": "low", and summary "No high-confidence issues were identified."
@@ -216,7 +380,8 @@ Return ONLY a valid JSON object matching this schema:
     );
 
     const rawResponse = response.data?.response;
-    return parseAndValidateReviewResponse(rawResponse);
+    const parsedResult = parseAndValidateReviewResponse(rawResponse);
+    return enrichFindingsWithTreeSitter(parsedResult, fileContentMap, diffText);
   } catch (error: any) {
     if (error?.code === "ECONNABORTED") {
       console.error(
@@ -234,5 +399,6 @@ Return ONLY a valid JSON object matching this schema:
     };
   }
 }
+
 
 
