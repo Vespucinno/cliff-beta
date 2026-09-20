@@ -1,5 +1,6 @@
 import axios from "axios";
 import { ReviewResult, Finding, SeverityLevel } from "../types";
+import { extractChangedLinesFromDiff } from "./treeSitter";
 
 export async function getPrDiff(
   diffUrl: string,
@@ -162,6 +163,7 @@ export async function publishGithubReview(
   prNumber: number,
   reviewData: ReviewResult,
   token: string,
+  diffText?: string,
 ): Promise<void> {
   const headers = {
     Authorization: `Bearer ${token}`,
@@ -171,14 +173,34 @@ export async function publishGithubReview(
   const mainBody = formatMainReviewMarkdown(reviewData);
 
   // Prepare inline comments for findings that have both file and line specified
-  const inlineComments = (reviewData.findings || [])
-    .filter((f): f is Finding & { file: string; line: number } => Boolean(f.file && f.line))
-    .map((f) => ({
-      path: f.file,
-      line: f.line,
-      side: "RIGHT",
-      body: formatFindingMarkdown(f, false),
-    }));
+  const candidates = (reviewData.findings || [])
+    .filter((f): f is Finding & { file: string; line: number } => Boolean(f.file && f.line));
+
+  // GitHub rejects (422) review comments whose line is not part of the PR diff.
+  // Only keep lines that were actually added/modified in the diff to avoid 422.
+  let validInline: (Finding & { file: string; line: number })[] = [];
+  if (diffText) {
+    const changedLinesMap: Record<string, Set<number>> = {};
+    for (const f of candidates) {
+      if (!changedLinesMap[f.file]) {
+        changedLinesMap[f.file] = extractChangedLinesFromDiff(diffText, f.file);
+      }
+      if (changedLinesMap[f.file].size > 0 && changedLinesMap[f.file].has(f.line)) {
+        validInline.push(f);
+      } else {
+        console.log(`[CLIFF] Skipping inline comment for ${f.file}:${f.line} — line is not an added/changed line in the diff.`);
+      }
+    }
+  } else {
+    validInline = candidates;
+  }
+
+  const inlineComments = validInline.map((f) => ({
+    path: f.file,
+    line: f.line,
+    side: "RIGHT",
+    body: formatFindingMarkdown(f, false),
+  }));
 
   // Try posting via GitHub PR Review API (supports inline comments)
   if (inlineComments.length > 0) {

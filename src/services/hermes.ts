@@ -1,5 +1,6 @@
 import axios from "axios";
 import path from "path";
+import dotenv from "dotenv";
 import { ReviewResult, ReviewResultSchema, SeverityLevel } from "../types";
 import { CallSite } from "./ast";
 import { 
@@ -8,10 +9,17 @@ import {
   extractChangedLinesFromDiff
 } from "./treeSitter";
 
-const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434/api/generate";
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "hermes3";
-const OLLAMA_TIMEOUT = parseInt(process.env.OLLAMA_TIMEOUT || "300000", 10); // Default 5 minutes
+dotenv.config();
+
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "nex-agi/nex-n2.5-pro:free";
+const OPENROUTER_BASE_URL = process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1";
+const OPENROUTER_FALLBACK_MODELS = (process.env.OPENROUTER_FALLBACK_MODELS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 const MAX_DIFF_LENGTH = parseInt(process.env.MAX_DIFF_LENGTH || "20000", 10);
+const LLM_TIMEOUT = parseInt(process.env.LLM_TIMEOUT || "300000", 10); // Default 5 minutes
 
 export function parseAndValidateReviewResponse(rawInput: unknown): ReviewResult {
   let parsed: any;
@@ -45,8 +53,12 @@ export function parseAndValidateReviewResponse(rawInput: unknown): ReviewResult 
 
   // Safe fallback if JSON parsing failed completely
   if (!parsed || typeof parsed !== "object") {
+    const rawPreview =
+      typeof rawInput === "string" && rawInput.trim().length > 0
+        ? rawInput.trim().slice(0, 300)
+        : "(empty response)";
     return {
-      summary: "Review output parsed with fallback due to malformed AI output.",
+      summary: `Review output parsed with fallback due to malformed AI output. Raw model response: ${JSON.stringify(rawPreview)}`,
       risk_level: "low",
       breaking_changes: [],
       findings: [],
@@ -281,6 +293,130 @@ function extractSearchTokensFromEvidence(evidenceSnippets: string[]): string[] {
   return tokens.sort((a, b) => b.length - a.length);
 }
 
+/**
+ * Attempts to recover valid JSON from malformed LLM output.
+ * Uses multiple strategies: markdown code block extraction, brace matching, 
+ * trailing comma removal, and common LLM error fixes.
+ */
+function attemptJsonRecovery(text: string): any | null {
+  if (!text || typeof text !== "string") return null;
+  
+  let cleaned = text.trim();
+  
+  // Strategy 1: Extract from markdown code blocks
+  const codeBlockMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (codeBlockMatch) {
+    cleaned = codeBlockMatch[1].trim();
+  }
+  
+  // Strategy 2: Find outermost JSON object
+  const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    cleaned = jsonMatch[0].trim();
+  }
+  
+  // Strategy 3: Fix common JSON issues
+  try {
+    return JSON.parse(cleaned);
+  } catch (e) {
+    // Try fixing trailing commas
+    let fixed = cleaned
+      .replace(/,(\s*[}\]])/g, "$1")  // Remove trailing commas
+      .replace(/([{,]\s*)(\w+):/g, '$1"$2":')  // Quote unquoted keys
+      .replace(/: (\w+)([,}])/g, ': "$1"$2');  // Quote unquoted string values
+    
+    try {
+      return JSON.parse(fixed);
+    } catch (e2) {
+      // Strategy 4: Try to find and parse just the findings array
+      const findingsMatch = cleaned.match(/"findings"\s*:\s*(\[[\s\S]*\])/);
+      if (findingsMatch) {
+        try {
+          const findings = JSON.parse(findingsMatch[1]);
+          return { findings, summary: "Recovered from partial JSON", risk_level: "low", breaking_changes: [] };
+        } catch {}
+      }
+    }
+  }
+  
+  return null;
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function tryModelWithFormat(model: string, useJsonFormat: boolean, prompt: string): Promise<string | null> {
+  const requestBody: any = {
+    model,
+    messages: [
+      { role: "system", content: "You are an expert, evidence-based AI Code Reviewer. Always respond with valid JSON only." },
+      { role: "user", content: prompt }
+    ],
+    temperature: 0.1,
+    max_tokens: 4096,
+  };
+  
+  if (useJsonFormat) {
+    requestBody.response_format = { type: "json_object" };
+  }
+
+  const response = await axios.post(
+    `${OPENROUTER_BASE_URL}/chat/completions`,
+    requestBody,
+    {
+      timeout: LLM_TIMEOUT,
+      headers: {
+        "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/cliff",
+        "X-Title": "CLIFF AI Code Reviewer",
+      },
+    },
+  );
+
+  return response.data?.choices?.[0]?.message?.content || null;
+}
+
+/**
+ * Calls a model with retries for flaky free-tier providers.
+ * - Free & Cohere models skip `response_format` (Cohere free tier returns empty content when it's set).
+ * - Empty responses are retried up to MAX_EMPTY_RETRIES times with backoff.
+ * - If a paid model rejects `response_format`, retries once without it.
+ */
+async function callModelWithRetry(model: string, prompt: string): Promise<string | null> {
+  const supportsJsonFormat = !model.includes(":free") && !model.includes("cohere/");
+  const maxEmptyRetries = 3;
+
+  for (let attempt = 1; attempt <= maxEmptyRetries; attempt++) {
+    try {
+      const raw = await tryModelWithFormat(model, supportsJsonFormat, prompt);
+      if (raw && raw.trim().length > 0) {
+        return raw;
+      }
+      console.warn(
+        `[CLIFF] Model ${model} returned empty content (attempt ${attempt}/${maxEmptyRetries}${supportsJsonFormat ? ", with response_format" : ", without response_format"}). Retrying...`,
+      );
+    } catch (e: any) {
+      // If a paid model rejects response_format, retry the same attempt without it
+      if (supportsJsonFormat && attempt === 1) {
+        console.warn(`[CLIFF] Model ${model} rejected response_format, retrying without it...`);
+        try {
+          const raw = await tryModelWithFormat(model, false, prompt);
+          if (raw && raw.trim().length > 0) {
+            return raw;
+          }
+        } catch {
+          // fall through to backoff + next attempt
+        }
+      } else {
+        throw e;
+      }
+    }
+    await sleep(1000 * attempt);
+  }
+
+  return null;
+}
+
 export async function runHermesAnalysis(
   diffText: string,
   prTitle: string,
@@ -338,7 +474,7 @@ RULES FOR YOUR REVIEW:
 5. FILE AND LINE NUMBERS: Specify exact file path and line number for findings. If exact line cannot be determined reliably, set "line": null (do NOT invent or hallucinate line numbers).
 6. CONFIDENCE: Set confidence to "low", "medium", or "high" based on how strongly repository evidence supports the finding.
 
-Return ONLY a valid JSON object matching this schema:
+Return ONLY a valid JSON object matching this schema — NO markdown, NO commentary, NO extra text:
 {
   "summary": "Short concise summary of the PR and overall finding evaluation",
   "risk_level": "low | medium | high | critical",
@@ -359,40 +495,98 @@ Return ONLY a valid JSON object matching this schema:
       "confidence": "low | medium | high"
     }
   ]
-}`;
+}
+
+IMPORTANT: Output MUST be valid JSON. Do NOT wrap in markdown code fences. Do NOT include any text before or after the JSON object.`;
 
   try {
-    console.log(`[CLIFF] Sending request to Ollama (${OLLAMA_MODEL}) with timeout ${OLLAMA_TIMEOUT}ms...`);
-    const response = await axios.post(
-      OLLAMA_URL,
-      {
-        model: OLLAMA_MODEL,
-        prompt,
-        stream: false,
-        format: "json",
-        keep_alive: "30m",
-        options: {
-          num_predict: 2048,
-          temperature: 0.1,
-        },
-      },
-      { timeout: OLLAMA_TIMEOUT },
-    );
-
-    const rawResponse = response.data?.response;
-    const parsedResult = parseAndValidateReviewResponse(rawResponse);
-    return enrichFindingsWithTreeSitter(parsedResult, fileContentMap, diffText);
+    console.log(`[CLIFF] Sending request to OpenRouter (${OPENROUTER_MODEL}) with timeout ${LLM_TIMEOUT}ms...`);
+    console.log(`[CLIFF] API Key present: ${!!OPENROUTER_API_KEY}, Base URL: ${OPENROUTER_BASE_URL}`);
+    
+    // Fallback models to try if primary fails (configurable via OPENROUTER_FALLBACK_MODELS).
+    // All verified working free-tier models that return valid JSON without response_format.
+    const fallbackModels = [
+      OPENROUTER_MODEL,
+      ...(OPENROUTER_FALLBACK_MODELS.length > 0
+        ? OPENROUTER_FALLBACK_MODELS
+        : [
+            "nex-agi/nex-n2.5-mini:free",
+            "cohere/north-mini-code:free",
+            "nvidia/nemotron-3-super-120b-a12b:free",
+            "dots-studio/dots-3-note-preview:free",
+          ]),
+    ].filter((m, i, a) => a.indexOf(m) === i); // deduplicate
+    
+    let lastError: any = null;
+    
+    for (const model of fallbackModels) {
+      try {
+        console.log(`[CLIFF] Trying model: ${model}`);
+        
+        // Call with retries for flaky empty responses; Cohere/free models skip response_format automatically
+        const rawResponse = await callModelWithRetry(model, prompt);
+        
+        // If this model exhausted retries with empty content, try the next fallback model
+        if (!rawResponse || rawResponse.trim().length === 0) {
+          console.warn(`[CLIFF] Model ${model} exhausted retries with empty content. Trying next model...`);
+          continue;
+        }
+        
+        console.log(`[CLIFF] Raw response length: ${rawResponse.length}`);
+        console.log(`[CLIFF] Raw response preview: ${rawResponse.slice(0, 200)}...`);
+        
+        // Try parsing with recovery strategies
+        let parsedResult = parseAndValidateReviewResponse(rawResponse);
+        
+        // If the malformed-output fallback was triggered, attempt JSON recovery
+        if (parsedResult.summary.includes("fallback due to malformed")) {
+          console.log(`[CLIFF] Model ${model} returned malformed output. Attempting JSON recovery...`);
+          const recovered = attemptJsonRecovery(rawResponse);
+          if (recovered) {
+            parsedResult = parseAndValidateReviewResponse(recovered);
+            console.log(`[CLIFF] Recovery successful, findings: ${parsedResult.findings.length}`);
+          } else {
+            // Recovery failed — this model produced unusable output, try next fallback model
+            console.warn(
+              `[CLIFF] Model ${model} output could not be parsed. Raw: ${rawResponse.slice(0, 500)}... Skipping to next model.`,
+            );
+            continue;
+          }
+        }
+        
+        // Success - return result
+        return enrichFindingsWithTreeSitter(parsedResult, fileContentMap, diffText);
+        
+      } catch (modelError: any) {
+        lastError = modelError;
+        console.warn(`[CLIFF] Model ${model} failed:`, modelError?.response?.data?.error?.message || modelError?.message);
+        // Continue to next fallback model
+        continue;
+      }
+    }
+    
+    // All models failed or returned empty content
+    throw (lastError instanceof Error ? lastError : new Error("All OpenRouter models failed or returned empty responses."));
   } catch (error: any) {
     if (error?.code === "ECONNABORTED") {
       console.error(
-        `[CLIFF] Ollama timeout (${OLLAMA_TIMEOUT}ms exceeded). Model '${OLLAMA_MODEL}' was slow to generate output.`,
+        `[CLIFF] OpenRouter timeout (${LLM_TIMEOUT}ms exceeded). Model '${OPENROUTER_MODEL}' was slow to generate output.`,
       );
+    } else if (error?.response) {
+      console.error("[CLIFF] OpenRouter API error:", {
+        status: error.response.status,
+        statusText: error.response.statusText,
+        data: error.response.data,
+        headers: error.response.headers,
+      });
+    } else if (error?.request) {
+      console.error("[CLIFF] OpenRouter network error - no response received:", error.message);
     } else {
       console.error("[CLIFF] Hermes API error:", error?.message || error);
     }
     // Controlled fallback on error, never crash
     return {
-      summary: `Failed to complete AI analysis (${error?.code === "ECONNABORTED" ? "Timeout: local model generation took longer than configured limit" : "Service error"}).`,
+      summary: `Failed to complete AI analysis (${error?.code === "ECONNABORTED" ? "Timeout: model generation took longer than configured limit" : error?.response?.data?.error?.message || error?.message || "Service error"}).`,
       risk_level: "low",
       breaking_changes: [],
       findings: [],

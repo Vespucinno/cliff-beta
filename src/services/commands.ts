@@ -69,7 +69,7 @@ export async function handleGithubCommand(payload: any, token?: string): Promise
     const reviewData = await runHermesAnalysis(diffText, prTitle, [], fileContentMap);
 
     if (token) {
-      await publishGithubReview(repoFullName, issueNumber, reviewData, token);
+      await publishGithubReview(repoFullName, issueNumber, reviewData, token, diffUrl ? diffText : undefined);
     }
     return true;
   }
@@ -97,7 +97,7 @@ export async function handleGithubCommand(payload: any, token?: string): Promise
       const reviewData = await runHermesAnalysis(diffText, prTitle, [], fileContentMap);
 
       if (token) {
-        await publishGithubReview(repoFullName, issueNumber, reviewData, token);
+        await publishGithubReview(repoFullName, issueNumber, reviewData, token, diffText);
       }
     } else {
       console.warn("[CLIFF Commands] Unable to determine diffUrl for PR re-review.");
