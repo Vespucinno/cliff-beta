@@ -298,7 +298,7 @@ function extractSearchTokensFromEvidence(evidenceSnippets: string[]): string[] {
  * Uses multiple strategies: markdown code block extraction, brace matching, 
  * trailing comma removal, and common LLM error fixes.
  */
-function attemptJsonRecovery(text: string): any | null {
+export function attemptJsonRecovery(text: string): any | null {
   if (!text || typeof text !== "string") return null;
   
   let cleaned = text.trim();
@@ -417,44 +417,13 @@ async function callModelWithRetry(model: string, prompt: string): Promise<string
   return null;
 }
 
-export async function runHermesAnalysis(
-  diffText: string,
+export function buildReviewPromptBody(
+  safeDiffText: string,
+  dominoContext: string,
+  treeSitterContext: string,
   prTitle: string,
-  dominoSites: CallSite[] = [],
-  fileContentMap?: Record<string, string>,
-): Promise<ReviewResult> {
-  const safeDiffText = diffText.length > MAX_DIFF_LENGTH
-    ? `${diffText.slice(0, MAX_DIFF_LENGTH)}\n... [PR Diff truncated for LLM context length]`
-    : diffText;
-
-  const dominoContext = dominoSites.length
-    ? dominoSites
-        .map(
-          (site) =>
-            `- File: ${site.callerFile} (Line ${site.line})\n  Call Site: \`${site.snippet}\``,
-        )
-        .join("\n")
-    : "No downstream call sites detected.";
-
-  let treeSitterContext = "";
-  if (fileContentMap) {
-    const nodeSummaries: string[] = [];
-    for (const [file, content] of Object.entries(fileContentMap)) {
-      const nodes = await parseFileAstNodes(file, content);
-      if (nodes.length > 0) {
-        const nodeStr = nodes
-          .slice(0, 10)
-          .map((n) => `  * [${n.type}] (Lines ${n.startLine}-${n.endLine}): \`${n.snippet}\``)
-          .join("\n");
-        nodeSummaries.push(`File: ${file}\n${nodeStr}`);
-      }
-    }
-    if (nodeSummaries.length > 0) {
-      treeSitterContext = `\n=== TREE-SITTER REPOSITORY CODE NODES ===\n${nodeSummaries.join("\n\n")}\n`;
-    }
-  }
-
-  const prompt = `You are an expert, evidence-based AI Code Reviewer. Analyze the PR diff below for concrete issues (prioritizing security and correctness).
+): string {
+  return `You are an expert, evidence-based AI Code Reviewer. Analyze the PR diff below for concrete issues (prioritizing security and correctness).
 
 PR Title: ${prTitle}
 
@@ -498,6 +467,55 @@ Return ONLY a valid JSON object matching this schema — NO markdown, NO comment
 }
 
 IMPORTANT: Output MUST be valid JSON. Do NOT wrap in markdown code fences. Do NOT include any text before or after the JSON object.`;
+}
+
+export async function buildReviewPrompt(
+  diffText: string,
+  prTitle: string,
+  dominoSites: CallSite[] = [],
+  fileContentMap?: Record<string, string>,
+): Promise<string> {
+  const safeDiffText = diffText.length > MAX_DIFF_LENGTH
+    ? `${diffText.slice(0, MAX_DIFF_LENGTH)}\n... [PR Diff truncated for LLM context length]`
+    : diffText;
+
+  const dominoContext = dominoSites.length
+    ? dominoSites
+        .map(
+          (site) =>
+            `- File: ${site.callerFile} (Line ${site.line})\n  Call Site: \`${site.snippet}\``,
+        )
+        .join("\n")
+    : "No downstream call sites detected.";
+
+  let treeSitterContext = "";
+  if (fileContentMap) {
+    const nodeSummaries: string[] = [];
+    for (const [file, content] of Object.entries(fileContentMap)) {
+      const nodes = await parseFileAstNodes(file, content);
+      if (nodes.length > 0) {
+        const nodeStr = nodes
+          .slice(0, 10)
+          .map((n) => `  * [${n.type}] (Lines ${n.startLine}-${n.endLine}): \`${n.snippet}\``)
+          .join("\n");
+        nodeSummaries.push(`File: ${file}\n${nodeStr}`);
+      }
+    }
+    if (nodeSummaries.length > 0) {
+      treeSitterContext = `\n=== TREE-SITTER REPOSITORY CODE NODES ===\n${nodeSummaries.join("\n\n")}\n`;
+    }
+  }
+
+  return buildReviewPromptBody(safeDiffText, dominoContext, treeSitterContext, prTitle);
+}
+
+export async function runHermesAnalysis(
+  diffText: string,
+  prTitle: string,
+  dominoSites: CallSite[] = [],
+  fileContentMap?: Record<string, string>,
+): Promise<ReviewResult> {
+  const prompt = await buildReviewPrompt(diffText, prTitle, dominoSites, fileContentMap);
 
   try {
     console.log(`[CLIFF] Sending request to OpenRouter (${OPENROUTER_MODEL}) with timeout ${LLM_TIMEOUT}ms...`);
